@@ -103,7 +103,7 @@ func TestResizeUploadReturnsDownloadBytes(t *testing.T) {
 	writeJPEGTo(t, &input, 1600, 800, 95)
 	file := multipart.File(nopFile{bytes.NewReader(input.Bytes())})
 
-	result, err := resizeUpload(file, "wide.jpg", 400, 80)
+	result, err := resizeUpload(file, "wide.jpg", 400, 80, "jpeg")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,8 +148,49 @@ func TestResolveResizeWidthSupportsPresetsAndCustomWidth(t *testing.T) {
 
 func TestResizeUploadRejectsUnsupportedImages(t *testing.T) {
 	file := multipart.File(nopFile{bytes.NewReader([]byte("not an image"))})
-	if _, err := resizeUpload(file, "notes.txt", 400, 80); err == nil {
+	if _, err := resizeUpload(file, "notes.txt", 400, 80, "webp"); err == nil {
 		t.Fatal("expected unsupported upload to fail")
+	}
+}
+
+func TestResizeUploadCanExportEverySupportedFormat(t *testing.T) {
+	var input bytes.Buffer
+	writeJPEGTo(t, &input, 80, 40, 90)
+
+	tests := []struct {
+		format      string
+		contentType string
+		filename    string
+	}{
+		{format: "jpeg", contentType: "image/jpeg", filename: "source-webfit.jpg"},
+		{format: "png", contentType: "image/png", filename: "source-webfit.png"},
+		{format: "webp", contentType: "image/webp", filename: "source-webfit.webp"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.format, func(t *testing.T) {
+			file := multipart.File(nopFile{bytes.NewReader(input.Bytes())})
+			result, err := resizeUpload(file, "source.jpg", 40, 82, tt.format)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.contentType != tt.contentType || result.filename != tt.filename {
+				t.Fatalf("got content type %q and filename %q", result.contentType, result.filename)
+			}
+			if _, _, err := image.Decode(bytes.NewReader(result.data)); err != nil {
+				t.Fatalf("export is not a decodable image: %v", err)
+			}
+		})
+	}
+}
+
+func TestResolveOutputFormat(t *testing.T) {
+	for _, value := range []string{"", "jpg", "jpeg", "png", "webp", "WEBP"} {
+		if _, err := resolveOutputFormat(value); err != nil {
+			t.Fatalf("expected %q to be accepted: %v", value, err)
+		}
+	}
+	if _, err := resolveOutputFormat("gif"); err == nil {
+		t.Fatal("expected unsupported output format to fail")
 	}
 }
 
