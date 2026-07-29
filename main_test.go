@@ -183,6 +183,45 @@ func TestResizeUploadCanExportEverySupportedFormat(t *testing.T) {
 	}
 }
 
+func TestCropUploadReturnsRequestedPixelsAndDimensions(t *testing.T) {
+	source := image.NewRGBA(image.Rect(0, 0, 6, 4))
+	for y := 0; y < 4; y++ {
+		for x := 0; x < 6; x++ {
+			source.Set(x, y, color.RGBA{R: uint8(x * 30), G: uint8(y * 40), B: 20, A: 255})
+		}
+	}
+	var input bytes.Buffer
+	if err := png.Encode(&input, source); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := cropUpload(multipart.File(nopFile{bytes.NewReader(input.Bytes())}), "source.png", image.Rect(2, 1, 5, 3), 90, "png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.filename != "source-cropped.png" || result.outWidth != 3 || result.outHeight != 2 {
+		t.Fatalf("unexpected crop result: %#v", result)
+	}
+	cropped, err := png.Decode(bytes.NewReader(result.data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := color.RGBAModel.Convert(cropped.At(0, 0)), color.RGBAModel.Convert(source.At(2, 1)); got != want {
+		t.Fatalf("top-left crop pixel = %v, want %v", got, want)
+	}
+}
+
+func TestCropUploadRejectsAreaOutsideImage(t *testing.T) {
+	var input bytes.Buffer
+	if err := png.Encode(&input, image.NewRGBA(image.Rect(0, 0, 20, 10))); err != nil {
+		t.Fatal(err)
+	}
+	_, err := cropUpload(multipart.File(nopFile{bytes.NewReader(input.Bytes())}), "source.png", image.Rect(15, 5, 25, 12), 90, "png")
+	if err == nil {
+		t.Fatal("expected out-of-bounds crop to fail")
+	}
+}
+
 func TestResolveOutputFormat(t *testing.T) {
 	for _, value := range []string{"", "jpg", "jpeg", "png", "webp", "WEBP"} {
 		if _, err := resolveOutputFormat(value); err != nil {

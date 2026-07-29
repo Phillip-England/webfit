@@ -1,6 +1,6 @@
 # webfit
 
-`webfit` is a small password-protected image resizing web app.
+`webfit` is a small password-protected web app for resizing and cropping images.
 
 ## Setup
 
@@ -29,7 +29,10 @@ Optional address:
 go run . -env ./config/.env -addr 0.0.0.0:8787
 ```
 
-The app requires login, accepts a JPEG, PNG, or WebP upload, resizes it to a standard web target or custom width, and downloads the resized result. Uploaded images are not stored. WebP uploads are exported as JPEG.
+The app requires login and accepts JPEG, PNG, or WebP uploads. The resize tool
+supports standard web targets and custom widths. The crop tool includes an
+interactive crop box, common aspect-ratio presets, exact pixel controls, and
+JPEG, PNG, or WebP export. Uploaded images are not stored.
 
 Standard targets:
 

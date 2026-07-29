@@ -155,6 +155,7 @@ func serve(args []string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", app.requireAuth(app.handleIndex))
 	mux.HandleFunc("/resize", app.requireAuth(app.handleResize))
+	mux.HandleFunc("/crop", app.requireAuth(app.handleCrop))
 	mux.HandleFunc("/login", app.handleLogin)
 	mux.HandleFunc("/logout", app.handleLogout)
 
@@ -353,6 +354,56 @@ func (a *app) handleResize(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(result.data)
 }
 
+func (a *app) handleCrop(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		writeHTML(w, cropHTML)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
+		http.Error(w, "upload must be 50 MiB or smaller", http.StatusBadRequest)
+		return
+	}
+	x, errX := parseIntField(r, "x", -1)
+	y, errY := parseIntField(r, "y", -1)
+	width, errW := parseIntField(r, "crop_width", 0)
+	height, errH := parseIntField(r, "crop_height", 0)
+	if errX != nil || errY != nil || errW != nil || errH != nil || x < 0 || y < 0 || width < 1 || height < 1 {
+		http.Error(w, "crop coordinates must be positive whole pixels", http.StatusBadRequest)
+		return
+	}
+	quality, err := parseIntField(r, "quality", 90)
+	if err != nil || quality < 1 || quality > 100 {
+		http.Error(w, "quality must be between 1 and 100", http.StatusBadRequest)
+		return
+	}
+	outputFormat, err := resolveOutputFormat(r.FormValue("format"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	file, header, err := r.FormFile("image")
+	if err != nil {
+		http.Error(w, "image upload is required", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+	result, err := cropUpload(file, header.Filename, image.Rect(x, y, x+width, y+height), quality, outputFormat)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", result.contentType)
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, result.filename))
+	w.Header().Set("X-Webfit-Output-Size", strconv.FormatInt(int64(len(result.data)), 10))
+	w.Header().Set("X-Webfit-Output-Dimensions", fmt.Sprintf("%dx%d", result.outWidth, result.outHeight))
+	_, _ = w.Write(result.data)
+}
+
 func (a *app) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !a.isAuthenticated(r) {
@@ -496,6 +547,33 @@ func resizeUpload(file multipart.File, filename string, maxWidth int, quality in
 	}, nil
 }
 
+func cropUpload(file multipart.File, filename string, crop image.Rectangle, quality int, outputFormat string) (uploadResult, error) {
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return uploadResult{}, err
+	}
+	img, err := decodeImage(filename, data)
+	if err != nil {
+		return uploadResult{}, err
+	}
+	bounds := img.Bounds()
+	absoluteCrop := crop.Add(bounds.Min)
+	if crop.Min.X < 0 || crop.Min.Y < 0 || crop.Dx() < 1 || crop.Dy() < 1 || !absoluteCrop.In(bounds) {
+		return uploadResult{}, errors.New("crop area must fit inside the image")
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, crop.Dx(), crop.Dy()))
+	draw.Draw(dst, dst.Bounds(), img, absoluteCrop.Min, draw.Src)
+	out, contentType, err := encodeImage(dst, quality, outputFormat)
+	if err != nil {
+		return uploadResult{}, err
+	}
+	return uploadResult{
+		data: out, filename: cropDownloadName(filename, contentType), contentType: contentType,
+		before: int64(len(data)), width: bounds.Dx(), height: bounds.Dy(),
+		outWidth: crop.Dx(), outHeight: crop.Dy(),
+	}, nil
+}
+
 type imageMeta struct {
 	width     int
 	height    int
@@ -504,6 +582,17 @@ type imageMeta struct {
 }
 
 func resizeBytes(name string, data []byte, maxWidth int, quality int, outputFormat string) ([]byte, imageMeta, string, error) {
+	img, err := decodeImage(name, data)
+	if err != nil {
+		return nil, imageMeta{}, "", err
+	}
+
+	img, meta := resizeToWidth(img, maxWidth)
+	out, contentType, err := encodeImage(img, quality, outputFormat)
+	return out, meta, contentType, err
+}
+
+func decodeImage(name string, data []byte) (image.Image, error) {
 	ext := strings.ToLower(filepath.Ext(name))
 	var img image.Image
 	var err error
@@ -515,26 +604,29 @@ func resizeBytes(name string, data []byte, maxWidth int, quality int, outputForm
 	case ".webp":
 		img, err = webp.Decode(bytes.NewReader(data))
 	default:
-		return nil, imageMeta{}, "", errors.New("supported uploads are JPEG, PNG, and WebP")
+		return nil, errors.New("supported uploads are JPEG, PNG, and WebP")
 	}
 	if err != nil {
-		return nil, imageMeta{}, "", fmt.Errorf("decode %s: %w", strings.TrimPrefix(ext, "."), err)
+		return nil, fmt.Errorf("decode %s: %w", strings.TrimPrefix(ext, "."), err)
 	}
+	return img, nil
+}
 
-	img, meta := resizeToWidth(img, maxWidth)
+func encodeImage(img image.Image, quality int, outputFormat string) ([]byte, string, error) {
 	var out bytes.Buffer
+	var err error
 	switch outputFormat {
 	case "jpeg":
 		err = jpeg.Encode(&out, img, &jpeg.Options{Quality: quality})
-		return out.Bytes(), meta, "image/jpeg", err
+		return out.Bytes(), "image/jpeg", err
 	case "png":
 		err = (&png.Encoder{CompressionLevel: png.BestCompression}).Encode(&out, img)
-		return out.Bytes(), meta, "image/png", err
+		return out.Bytes(), "image/png", err
 	case "webp":
 		err = nativewebp.Encode(&out, img, &nativewebp.Options{CompressionLevel: nativewebp.DefaultCompression})
-		return out.Bytes(), meta, "image/webp", err
+		return out.Bytes(), "image/webp", err
 	default:
-		return nil, imageMeta{}, "", fmt.Errorf("unsupported output format %q", outputFormat)
+		return nil, "", fmt.Errorf("unsupported output format %q", outputFormat)
 	}
 }
 
@@ -572,6 +664,14 @@ func resizeToWidth(img image.Image, maxWidth int) (image.Image, imageMeta) {
 }
 
 func downloadName(name string, contentType string) string {
+	return outputName(name, contentType, "-webfit")
+}
+
+func cropDownloadName(name string, contentType string) string {
+	return outputName(name, contentType, "-cropped")
+}
+
+func outputName(name string, contentType string, suffix string) string {
 	base := filepath.Base(name)
 	ext := filepath.Ext(base)
 	stem := strings.TrimSuffix(base, ext)
@@ -592,7 +692,7 @@ func downloadName(name string, contentType string) string {
 	if ext == "" {
 		ext = ".jpg"
 	}
-	return stem + "-webfit" + ext
+	return stem + suffix + ext
 }
 
 func sanitizeFilenamePart(value string) string {
@@ -752,6 +852,64 @@ window.addEventListener("load",()=>{document.getElementById("loading").textConte
 </body>
 </html>`
 
+const cropHTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crop image · webfit</title>
+<script>
+const savedTheme=localStorage.getItem("webfit-theme"),systemDark=matchMedia("(prefers-color-scheme: dark)").matches;
+document.documentElement.dataset.theme=savedTheme||(systemDark?"dark":"light");
+</script>
+<style>
+:root{color-scheme:light;--page:#f3f5f4;--surface:#fff;--muted:#f8faf9;--border:#dce3df;--strong:#c8d3cd;--text:#17211d;--secondary:#5f6f67;--faint:#88958e;--brand:#16755f;--brand-hover:#105f4d;--soft:#e8f4ef;--danger:#c24141;--focus:rgba(22,117,95,.22);--shadow:0 10px 30px rgba(30,51,42,.05),0 1px 2px rgba(30,51,42,.03)}
+:root[data-theme=dark]{color-scheme:dark;--page:#101513;--surface:#17201c;--muted:#1d2924;--border:#2d3b35;--strong:#43524b;--text:#eef5f1;--secondary:#b8c6bf;--faint:#81918a;--brand:#42b993;--brand-hover:#5fd0aa;--soft:#18382f;--danger:#f17d7d;--focus:rgba(66,185,147,.28);--shadow:0 10px 30px rgba(0,0,0,.22)}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--page);color:var(--text);font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select{font:inherit}button{cursor:pointer}button:focus-visible,input:focus-visible,select:focus-visible,.drop:focus-visible{outline:none;box-shadow:0 0 0 4px var(--focus)}
+.header{height:72px;background:color-mix(in srgb,var(--surface) 86%,transparent);backdrop-filter:blur(12px);border-bottom:1px solid var(--border);display:flex;align-items:center}.header-in{width:100%;max-width:1240px;margin:auto;padding:0 28px;display:flex;align-items:center;justify-content:space-between;gap:16px}.brand{display:flex;align-items:center;gap:12px;text-decoration:none;color:var(--text)}.mark{width:38px;height:38px;border-radius:11px;background:var(--brand);position:relative}.mark:before,.mark:after{content:"";position:absolute;border:2px solid white;width:12px;height:12px}.mark:before{left:8px;top:8px;border-right:0;border-bottom:0}.mark:after{right:8px;bottom:8px;border-left:0;border-top:0}.name{font-size:22px;font-weight:750;letter-spacing:-.03em}.tag{font-size:12px;color:var(--faint)}.nav{display:flex;gap:8px;align-items:center}.ghost{height:36px;border:1px solid transparent;border-radius:10px;background:transparent;color:var(--secondary);padding:0 10px;text-decoration:none;font-size:13px;font-weight:650;display:inline-flex;align-items:center}.ghost:hover{background:var(--muted);color:var(--text)}.ghost.active{background:var(--soft);color:var(--brand)}
+.container{max-width:1240px;margin:auto;padding:32px 28px 48px}.heading{display:flex;align-items:start;justify-content:space-between;margin-bottom:24px;gap:20px}h1{font-size:28px;letter-spacing:-.035em;margin:0}.desc{margin:8px 0 0;color:var(--secondary);line-height:1.5}.state{font-size:13px;color:var(--faint);padding-top:8px}.workspace{display:grid;grid-template-columns:330px minmax(0,1fr);gap:24px;align-items:start}.card{background:var(--surface);border:1px solid var(--border);border-radius:16px;box-shadow:var(--shadow)}.controls{padding:22px;display:grid;gap:22px}.section{display:grid;gap:11px}.title{font-size:13px;font-weight:700}.help{font-size:13px;color:var(--secondary);line-height:1.4;margin:2px 0 0}.hidden{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}
+.drop{min-height:126px;border:1.5px dashed var(--strong);border-radius:13px;background:var(--muted);display:grid;place-items:center;padding:18px;text-align:center;cursor:pointer;color:var(--secondary)}.drop:hover,.drop.drag{border-color:var(--brand);background:var(--soft)}.drop strong{display:block;color:var(--text);margin-bottom:5px}.chosen{display:none;width:100%;text-align:left}.chosen-name{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.chosen-meta{font-size:12px;color:var(--secondary);margin-top:5px}.replace{height:32px;margin-top:11px;border:1px solid var(--strong);border-radius:8px;background:var(--surface);color:var(--text);padding:0 10px;font-weight:650}
+.ratios{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.ratio{height:38px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--secondary);font-size:13px;font-weight:650}.ratio:hover{border-color:var(--strong)}.ratio.active{border-color:var(--brand);background:var(--soft);color:var(--brand);box-shadow:inset 0 0 0 1px var(--brand)}.fields{display:grid;grid-template-columns:1fr 1fr;gap:9px}.field{display:grid;gap:6px;color:var(--secondary);font-size:12px;font-weight:650}.field input,.select{width:100%;height:41px;border:1px solid var(--strong);border-radius:9px;background:var(--surface);color:var(--text);padding:0 11px}.format-row{display:grid;grid-template-columns:1fr 90px;gap:9px}.quality.hidden-quality{opacity:.5}
+.export{border-top:1px solid var(--border);padding-top:18px;display:grid;gap:11px}.summary{font-size:13px;color:var(--secondary)}.primary{height:49px;border:1px solid var(--brand);border-radius:10px;background:var(--brand);color:white;font-weight:750}.primary:hover{background:var(--brand-hover)}.primary:disabled{opacity:.5;cursor:not-allowed}.status{display:none;padding:10px;border-radius:9px;font-size:13px;line-height:1.4}.status.show{display:block}.status.error{color:var(--danger);background:color-mix(in srgb,var(--danger) 10%,var(--surface))}.status.success{color:var(--brand);background:var(--soft)}
+.editor{overflow:hidden;min-height:600px;display:flex;flex-direction:column}.toolbar{height:50px;border-bottom:1px solid var(--border);padding:0 16px;display:flex;align-items:center;justify-content:space-between;font-size:13px}.toolbar strong{font-size:14px}.hint{color:var(--faint)}.stage{flex:1;min-height:490px;background:var(--muted);display:grid;place-items:center;padding:28px;overflow:hidden}.empty{text-align:center;color:var(--secondary)}.empty-icon{width:58px;height:46px;border:2px solid var(--strong);border-radius:9px;margin:0 auto 12px}.empty strong{display:block;color:var(--text);margin-bottom:7px}.canvas-wrap{display:none;max-width:100%;max-height:500px;position:relative;line-height:0;box-shadow:0 16px 36px rgba(20,38,31,.2)}canvas{display:block;max-width:100%;max-height:500px;touch-action:none;cursor:crosshair}.footer{border-top:1px solid var(--border);padding:15px 16px;display:flex;justify-content:space-between;color:var(--secondary);font-size:13px}.footer strong{color:var(--text)}
+@media(max-width:850px){.workspace{grid-template-columns:1fr}.editor{min-height:480px}.stage{min-height:360px}.controls{order:2}.editor{order:1}}@media(max-width:600px){.header{height:64px}.header-in,.container{padding-left:16px;padding-right:16px}.tag,.state,.logout{display:none}.container{padding-top:20px}.heading{margin-bottom:18px}.nav{gap:2px}.stage{padding:12px}.hint{display:none}}
+</style>
+</head>
+<body>
+<header class="header"><div class="header-in"><a class="brand" href="/"><span class="mark"></span><span><span class="name">webfit</span><span class="tag">Web-ready image tools</span></span></a><nav class="nav"><a class="ghost" href="/">Resize</a><a class="ghost active" href="/crop">Crop</a><button id="theme" class="ghost" type="button">Theme</button><a class="ghost logout" href="/logout">Log out</a></nav></div></header>
+<main class="container"><div class="heading"><div><h1>Crop image</h1><p class="desc">Frame the part you need, choose an aspect ratio, and export a clean crop.</p></div><div id="state" class="state">No image selected</div></div>
+<div class="workspace">
+<form id="form" class="card controls">
+<section class="section"><div><div class="title">Upload image</div><p class="help">PNG, JPG, or WebP up to 50 MiB.</p></div><input id="file" class="hidden" type="file" name="image" accept="image/png,image/jpeg,image/webp" required><div id="drop" class="drop" role="button" tabindex="0"><div id="emptyUpload"><strong>Drop an image here</strong><span>or click to browse</span></div><div id="chosen" class="chosen"><div id="chosenName" class="chosen-name"></div><div id="chosenMeta" class="chosen-meta"></div><button class="replace" type="button">Choose another</button></div></div></section>
+<section class="section"><div><div class="title">Aspect ratio</div><p class="help">Pick a format, then drag on the image to reframe it.</p></div><div class="ratios"><button class="ratio active" type="button" data-ratio="free">Free</button><button class="ratio" type="button" data-ratio="1">1 : 1</button><button class="ratio" type="button" data-ratio="1.333333">4 : 3</button><button class="ratio" type="button" data-ratio="1.777778">16 : 9</button><button class="ratio" type="button" data-ratio="0.8">4 : 5</button><button class="ratio" type="button" data-ratio="0.5625">9 : 16</button></div></section>
+<section class="section"><div><div class="title">Crop area</div><p class="help">Fine-tune the selection in original pixels.</p></div><div class="fields"><label class="field">X<input id="x" name="x" type="number" min="0"></label><label class="field">Y<input id="y" name="y" type="number" min="0"></label><label class="field">Width<input id="cw" name="crop_width" type="number" min="1"></label><label class="field">Height<input id="ch" name="crop_height" type="number" min="1"></label></div></section>
+<section class="section"><div class="format-row"><label class="field">Output format<select id="format" class="select" name="format"><option value="webp">WebP</option><option value="jpeg">JPEG</option><option value="png">PNG</option></select></label><label id="qualityWrap" class="field quality">Quality<input id="quality" name="quality" type="number" min="40" max="100" value="90"></label></div></section>
+<section class="export"><div id="summary" class="summary">Select an image to begin.</div><div id="status" class="status" aria-live="polite"></div><button id="submit" class="primary" disabled>Crop and download</button></section>
+</form>
+<section class="card editor"><div class="toolbar"><strong>Crop preview</strong><span class="hint">Drag to draw · drag inside to move</span></div><div class="stage"><div id="empty" class="empty"><div class="empty-icon"></div><strong>Your image will appear here</strong><span>Upload an image to start cropping.</span></div><div id="canvasWrap" class="canvas-wrap"><canvas id="canvas"></canvas></div></div><div class="footer"><span>Original <strong id="original">—</strong></span><span>Crop <strong id="cropMeta">—</strong></span></div></section>
+</div></main>
+<script>
+const file=document.getElementById("file"),drop=document.getElementById("drop"),chosen=document.getElementById("chosen"),emptyUpload=document.getElementById("emptyUpload"),chosenName=document.getElementById("chosenName"),chosenMeta=document.getElementById("chosenMeta"),canvas=document.getElementById("canvas"),ctx=canvas.getContext("2d"),wrap=document.getElementById("canvasWrap"),empty=document.getElementById("empty"),form=document.getElementById("form"),submit=document.getElementById("submit"),summary=document.getElementById("summary"),statusEl=document.getElementById("status"),state=document.getElementById("state"),original=document.getElementById("original"),cropMeta=document.getElementById("cropMeta"),format=document.getElementById("format"),quality=document.getElementById("quality"),qualityWrap=document.getElementById("qualityWrap"),inputs={x:document.getElementById("x"),y:document.getElementById("y"),w:document.getElementById("cw"),h:document.getElementById("ch")};
+let img=null,current=null,url="",sel={x:0,y:0,w:0,h:0},ratio=null,drag=null;
+const theme=document.getElementById("theme");function themeLabel(){theme.textContent=document.documentElement.dataset.theme==="dark"?"Light mode":"Dark mode"}theme.onclick=()=>{const v=document.documentElement.dataset.theme==="dark"?"light":"dark";document.documentElement.dataset.theme=v;localStorage.setItem("webfit-theme",v);themeLabel()};themeLabel();
+function bytes(n){if(n<1024)return n+" B";return (n/1048576).toFixed(n>10485760?0:1)+" MiB"}
+function showStatus(type,text){statusEl.className="status "+type+" show";statusEl.textContent=text}function clearStatus(){statusEl.className="status";statusEl.textContent=""}
+function fitSelection(){if(!img)return;let w=img.naturalWidth,h=img.naturalHeight;if(ratio){if(w/h>ratio)w=Math.round(h*ratio);else h=Math.round(w/ratio)}sel={x:Math.round((img.naturalWidth-w)/2),y:Math.round((img.naturalHeight-h)/2),w,h};sync()}
+function sync(){if(!img)return;sel.x=Math.max(0,Math.min(Math.round(sel.x),img.naturalWidth-1));sel.y=Math.max(0,Math.min(Math.round(sel.y),img.naturalHeight-1));sel.w=Math.max(1,Math.min(Math.round(sel.w),img.naturalWidth-sel.x));sel.h=Math.max(1,Math.min(Math.round(sel.h),img.naturalHeight-sel.y));inputs.x.value=sel.x;inputs.y.value=sel.y;inputs.w.value=sel.w;inputs.h.value=sel.h;cropMeta.textContent=sel.w+" × "+sel.h+" px";summary.textContent=sel.w+" × "+sel.h+" px · "+format.options[format.selectedIndex].text+" export";draw()}
+function draw(){if(!img)return;ctx.clearRect(0,0,canvas.width,canvas.height);ctx.drawImage(img,0,0);ctx.save();ctx.fillStyle="rgba(5,12,9,.62)";ctx.beginPath();ctx.rect(0,0,canvas.width,canvas.height);ctx.rect(sel.x,sel.y,sel.w,sel.h);ctx.fill("evenodd");ctx.strokeStyle="#fff";ctx.lineWidth=Math.max(2,canvas.width/600);ctx.strokeRect(sel.x,sel.y,sel.w,sel.h);ctx.setLineDash([canvas.width/180,canvas.width/180]);ctx.lineWidth=1;ctx.globalAlpha=.7;for(let i=1;i<3;i++){ctx.beginPath();ctx.moveTo(sel.x+sel.w*i/3,sel.y);ctx.lineTo(sel.x+sel.w*i/3,sel.y+sel.h);ctx.moveTo(sel.x,sel.y+sel.h*i/3);ctx.lineTo(sel.x+sel.w,sel.y+sel.h*i/3);ctx.stroke()}ctx.restore()}
+function point(e){const r=canvas.getBoundingClientRect();return{x:(e.clientX-r.left)*canvas.width/r.width,y:(e.clientY-r.top)*canvas.height/r.height}}
+canvas.onpointerdown=e=>{if(!img)return;canvas.setPointerCapture(e.pointerId);const p=point(e),inside=p.x>=sel.x&&p.x<=sel.x+sel.w&&p.y>=sel.y&&p.y<=sel.y+sel.h;drag={mode:inside?"move":"draw",start:p,original:{...sel}};if(!inside){sel={x:p.x,y:p.y,w:1,h:1};sync()}};
+canvas.onpointermove=e=>{if(!drag)return;const p=point(e);if(drag.mode==="move"){sel.x=Math.max(0,Math.min(drag.original.x+p.x-drag.start.x,img.naturalWidth-sel.w));sel.y=Math.max(0,Math.min(drag.original.y+p.y-drag.start.y,img.naturalHeight-sel.h))}else{let dx=p.x-drag.start.x,dy=p.y-drag.start.y;if(ratio){const signY=dy<0?-1:1,signX=dx<0?-1:1;if(Math.abs(dx/dy)>ratio)dy=signY*Math.abs(dx)/ratio;else dx=signX*Math.abs(dy)*ratio}sel.x=Math.min(drag.start.x,drag.start.x+dx);sel.y=Math.min(drag.start.y,drag.start.y+dy);sel.w=Math.abs(dx);sel.h=Math.abs(dy)}sync()};
+canvas.onpointerup=()=>drag=null;canvas.onpointercancel=()=>drag=null;
+function load(f){if(!f)return;if(!/^image\/(png|jpeg|webp)$/.test(f.type)){showStatus("error","Choose a PNG, JPG, or WebP image.");return}if(url)URL.revokeObjectURL(url);url=URL.createObjectURL(f);const next=new Image();next.onload=()=>{img=next;current=f;canvas.width=img.naturalWidth;canvas.height=img.naturalHeight;chosenName.textContent=f.name;chosenMeta.textContent=img.naturalWidth+" × "+img.naturalHeight+" · "+bytes(f.size);chosen.style.display="block";emptyUpload.style.display="none";wrap.style.display="block";empty.style.display="none";state.textContent=f.name;original.textContent=img.naturalWidth+" × "+img.naturalHeight+" px";submit.disabled=false;clearStatus();fitSelection()};next.onerror=()=>showStatus("error","This image could not be opened.");next.src=url}
+drop.onclick=e=>{if(!e.target.closest(".replace"))file.click()};drop.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();file.click()}};drop.ondragover=e=>{e.preventDefault();drop.classList.add("drag")};drop.ondragleave=()=>drop.classList.remove("drag");drop.ondrop=e=>{e.preventDefault();drop.classList.remove("drag");if(e.dataTransfer.files[0]){file.files=e.dataTransfer.files;load(e.dataTransfer.files[0])}};document.querySelector(".replace").onclick=e=>{e.stopPropagation();file.click()};file.onchange=()=>load(file.files[0]);
+document.querySelectorAll(".ratio").forEach(b=>b.onclick=()=>{document.querySelectorAll(".ratio").forEach(x=>x.classList.remove("active"));b.classList.add("active");ratio=b.dataset.ratio==="free"?null:Number(b.dataset.ratio);fitSelection()});
+Object.values(inputs).forEach(el=>el.onchange=()=>{sel={x:Number(inputs.x.value),y:Number(inputs.y.value),w:Number(inputs.w.value),h:Number(inputs.h.value)};sync()});format.onchange=()=>{qualityWrap.classList.toggle("hidden-quality",format.value!=="jpeg");sync()};
+form.onsubmit=async e=>{e.preventDefault();if(!current)return;submit.disabled=true;submit.textContent="Cropping…";clearStatus();try{const res=await fetch("/crop",{method:"POST",body:new FormData(form)});if(!res.ok)throw new Error((await res.text()).trim()||"The image could not be cropped.");const blob=await res.blob(),a=document.createElement("a"),d=res.headers.get("Content-Disposition")||"",m=/filename="([^"]+)"/.exec(d);a.href=URL.createObjectURL(blob);a.download=m?m[1]:"cropped-image";document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),1000);showStatus("success","Crop ready — your download has started.")}catch(err){showStatus("error",err.message)}finally{submit.disabled=false;submit.textContent="Crop and download"}};
+</script>
+</body>
+</html>`
+
 func renderLogin(errorText string) string {
 	return loginHTMLStart + htmlEscape(errorText) + loginHTMLEnd
 }
@@ -813,7 +971,7 @@ h1{font-size:28px;line-height:1.15;letter-spacing:-.035em;margin:0;font-weight:7
 <header class="app-header">
 <div class="header-inner">
 <div class="brand"><div class="mark" aria-hidden="true"></div><div><div class="logo-name">webfit</div><div class="logo-subtitle">Web-ready image resizing</div></div></div>
-<nav class="header-actions" aria-label="Application actions"><span class="user-pill">Admin</span><button id="themeToggle" class="ghost-button" type="button" aria-label="Toggle color theme">Theme</button><a class="ghost-button" href="/logout" aria-label="Log out">Log out</a></nav>
+<nav class="header-actions" aria-label="Application actions"><a class="ghost-button" href="/crop">Crop image</a><span class="user-pill">Admin</span><button id="themeToggle" class="ghost-button" type="button" aria-label="Toggle color theme">Theme</button><a class="ghost-button" href="/logout" aria-label="Log out">Log out</a></nav>
 </div>
 </header>
 <main class="container">
