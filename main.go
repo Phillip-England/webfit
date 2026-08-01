@@ -33,7 +33,7 @@ import (
 
 const (
 	defaultEnvPath  = "config/.env"
-	defaultDBPath   = "../data/main.sqlite"
+	defaultDBPath   = "data/main.sqlite"
 	sessionCookie   = "webfit_session"
 	sessionLifetime = 12 * time.Hour
 	rateWindow      = 24 * time.Hour
@@ -104,36 +104,30 @@ func initEnv(args []string) error {
 	if err := os.MkdirAll(filepath.Dir(*envPath), 0755); err != nil {
 		return err
 	}
-	envDir := filepath.Dir(*envPath)
-	dbPath := filepath.Clean(filepath.Join(envDir, defaultDBPath))
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(defaultDBPath), 0755); err != nil {
 		return err
 	}
-	content := fmt.Sprintf("ADMIN_USERNAME=admin\nADMIN_PASSWORD=change-me-now\nSESSION_SECRET=%s\nDB_PATH=%s\n", secret, defaultDBPath)
+	content := fmt.Sprintf("ADMIN_USERNAME=admin\nADMIN_PASSWORD=change-me-now\nSESSION_SECRET=%s\n", secret)
 	if err := writeNewFile(*envPath, []byte(content), 0600); err != nil {
 		return err
 	}
 	fmt.Printf("created %s\n", *envPath)
-	fmt.Printf("database path: %s\n", dbPath)
+	fmt.Printf("database path: %s\n", defaultDBPath)
 	return nil
 }
 
 func serve(args []string) error {
 	fs := flag.NewFlagSet("webfit", flag.ExitOnError)
 	addr := fs.String("addr", "0.0.0.0:8787", "address for the web app")
-	envPath := fs.String("env", "", "required environment file")
+	envPath := fs.String("env", defaultEnvPath, "environment file")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage:")
 		fmt.Fprintln(os.Stderr, "  webfit init")
-		fmt.Fprintln(os.Stderr, "  webfit -env ./config/.env [-addr 0.0.0.0:8787]")
+		fmt.Fprintln(os.Stderr, "  webfit [-env ./config/.env] [-addr 0.0.0.0:8787]")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
 		return err
-	}
-	if *envPath == "" {
-		fs.Usage()
-		return errors.New("missing required -env path")
 	}
 
 	cfg, err := loadEnv(*envPath)
@@ -189,13 +183,10 @@ func loadEnv(path string) (appConfig, error) {
 		AdminUsername: values["ADMIN_USERNAME"],
 		AdminPassword: values["ADMIN_PASSWORD"],
 		SessionSecret: values["SESSION_SECRET"],
-		DBPath:        values["DB_PATH"],
+		DBPath:        defaultDBPath,
 	}
-	if cfg.AdminUsername == "" || cfg.AdminPassword == "" || cfg.SessionSecret == "" || cfg.DBPath == "" {
-		return appConfig{}, errors.New("ADMIN_USERNAME, ADMIN_PASSWORD, SESSION_SECRET, and DB_PATH are required")
-	}
-	if !filepath.IsAbs(cfg.DBPath) {
-		cfg.DBPath = filepath.Clean(filepath.Join(filepath.Dir(path), cfg.DBPath))
+	if cfg.AdminUsername == "" || cfg.AdminPassword == "" || cfg.SessionSecret == "" {
+		return appConfig{}, errors.New("ADMIN_USERNAME, ADMIN_PASSWORD, and SESSION_SECRET are required")
 	}
 	return cfg, nil
 }

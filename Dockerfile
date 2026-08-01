@@ -14,4 +14,4 @@ COPY --from=build /webfit /app/webfit
 ENV PORT=8787
 EXPOSE 8787
 
-CMD ["sh", "-c", "test -f config/.env || ./webfit init; exec ./webfit -env config/.env -addr 0.0.0.0:8787"]
+CMD ["sh", "-c", "test -f config/.env || ./webfit init; exec ./webfit -addr 0.0.0.0:8787"]

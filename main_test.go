@@ -14,14 +14,14 @@ import (
 	"time"
 )
 
-func TestLoadEnvRequiresValuesAndResolvesDBRelativeToEnvFile(t *testing.T) {
+func TestLoadEnvRequiresValuesAndUsesDefaultDBPath(t *testing.T) {
 	dir := t.TempDir()
 	envDir := filepath.Join(dir, "config")
 	if err := os.MkdirAll(envDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 	envPath := filepath.Join(envDir, ".env")
-	if err := os.WriteFile(envPath, []byte("ADMIN_USERNAME=admin\nADMIN_PASSWORD=secret\nSESSION_SECRET=test-secret\nDB_PATH=../data/main.sqlite\n"), 0600); err != nil {
+	if err := os.WriteFile(envPath, []byte("ADMIN_USERNAME=admin\nADMIN_PASSWORD=secret\nSESSION_SECRET=test-secret\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -29,8 +29,7 @@ func TestLoadEnvRequiresValuesAndResolvesDBRelativeToEnvFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := filepath.Join(dir, "data", "main.sqlite")
-	if cfg.DBPath != want {
+	if want := defaultDBPath; cfg.DBPath != want {
 		t.Fatalf("expected DB path %q, got %q", want, cfg.DBPath)
 	}
 }

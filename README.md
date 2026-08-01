@@ -20,13 +20,13 @@ Edit `./config/.env` and change `ADMIN_PASSWORD` before exposing the app.
 ## Run
 
 ```sh
-go run . -env ./config/.env
+go run .
 ```
 
 Optional address:
 
 ```sh
-go run . -env ./config/.env -addr 0.0.0.0:8787
+go run . -addr 0.0.0.0:8787
 ```
 
 The app requires login and accepts JPEG, PNG, or WebP uploads. The resize tool
@@ -52,8 +52,7 @@ The browser reads the selected image dimensions and suggests a reasonable target
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=change-me-now
 SESSION_SECRET=<random-secret>
-DB_PATH=../data/main.sqlite
 ```
 
-`DB_PATH` may be relative to the environment file location.
+The app reads `./config/.env` by default and stores data at `./data/main.sqlite`.
 # webft
