@@ -1,0 +1,22 @@
+{
+  "variables": [
+    {
+      "name": "ADMIN_USERNAME",
+      "description": "Username required to sign in to the webfit admin interface. Choose the account name the app owner will use.",
+      "example": "admin",
+      "required": true
+    },
+    {
+      "name": "ADMIN_PASSWORD",
+      "description": "Password required to sign in to the webfit admin interface. Set this to a strong private password before exposing the app.",
+      "example": "change-this-password",
+      "required": true
+    },
+    {
+      "name": "SESSION_SECRET",
+      "description": "Random secret used to sign browser session cookies. Generate a long unpredictable value and keep it private.",
+      "example": "base64-or-hex-random-secret",
+      "required": true
+    }
+  ]
+}
